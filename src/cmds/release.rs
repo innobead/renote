@@ -31,6 +31,9 @@ pub struct ReleaseArgs {
     #[arg(long, help = "GitHub repo")]
     repo: String,
 
+    #[arg(long, value_delimiter = ',', help = "List of GitHub org/repo where issues are searched")]
+    ticket_sources: Option<Vec<String>>,
+
     #[arg(long, help = "Tag")]
     tag: String,
 
@@ -101,18 +104,43 @@ pub struct ReleaseArgs {
 #[async_trait]
 impl CliCommand for ReleaseArgs {
     async fn run(&self, _cli: &Cli) -> anyhow::Result<()> {
-        let git = GitCli::new(self.owner.clone(), self.repo.clone());
+        let ticket_sources = self.ticket_sources.clone().unwrap_or_default();
+        let mut owners = vec![];
+        let mut repos = vec![];
 
-        git.clone_repo(&self.branch)?;
-
-        if let Err(err) = git.delete_tag(&self.tag, self.force) {
-            if !self.force {
-                log::warn!("Skipped to force creating tag {}: {}", self.tag, err);
+        for source in ticket_sources {
+            let parts: Vec<&str> = source.split('/').collect();
+            if parts.len() != 2 {
+                return Err(anyhow!("Invalid ticket source format: {}", source));
             }
+            owners.push(parts[0].to_string());
+            repos.push(parts[1].to_string());
         }
 
-        let (mut issue_ids, mut issues) = self.search_issues().await?;
+        // Collect issues from all owner:repo pairs
+        let mut all_issue_ids = HashSet::new();
+        let mut all_issues = Vec::new();
 
+        for (owner, repo) in owners.iter().zip(repos.iter()) {
+            log::info!("Processing {}/{}", owner, repo);
+
+            let git = GitCli::new(owner.to_string(), repo.to_string());
+
+            git.clone_repo(&self.branch)?;
+
+            if let Err(err) = git.delete_tag(&self.tag, self.force) {
+                if !self.force {
+                    log::warn!("Skipped to force creating tag {}: {}", self.tag, err);
+                }
+            }
+
+            let (issue_ids, issues) = self.search_issues(owner, repo).await?;
+
+            all_issue_ids.extend(issue_ids);
+            all_issues.extend(issues);
+        }
+
+        // Apply filter hook to all collected issues
         if let Some(hook) = &self.filter_issue_hook {
             log::info!("Filtering issues by hook {}", hook);
 
@@ -120,8 +148,8 @@ impl CliCommand for ReleaseArgs {
             for issue_id in issue_lines.lines() {
                 let issue_id = issue_id.parse::<u64>()?;
 
-                if issue_ids.remove(&issue_id) {
-                    issues.retain(|issue| issue.number != issue_id)
+                if all_issue_ids.remove(&issue_id) {
+                    all_issues.retain(|issue| issue.number != issue_id)
                 }
             }
         }
@@ -141,8 +169,8 @@ impl CliCommand for ReleaseArgs {
         };
 
         let note = self.create_release(
-            &mut issue_ids,
-            &issues,
+            &mut all_issue_ids,
+            &all_issues,
             &pre_note,
             &post_note,
             self.note_section_disable,
@@ -166,15 +194,15 @@ fn read_note_file(path: impl Into<PathBuf>) -> String {
 }
 
 impl ReleaseArgs {
-    async fn search_issues(&self) -> anyhow::Result<(HashSet<u64>, Vec<Issue>)> {
-        log::info!("Searching issues");
+    async fn search_issues(&self, owner: &str, repo: &str) -> anyhow::Result<(HashSet<u64>, Vec<Issue>)> {
+        log::info!("Searching issues for {}/{}", owner, repo);
 
         let labels = self.labels.clone().unwrap_or_default();
         let exclude_labels = self.exclude_labels.clone().unwrap_or_default();
 
         let milestones: Vec<Milestone> = github_client()
             .get(
-                format!("/repos/{}/{}/milestones", self.owner, self.repo),
+                format!("/repos/{}/{}/milestones", owner, repo),
                 None::<&()>,
             )
             .await?;
@@ -195,7 +223,7 @@ impl ReleaseArgs {
         let mut issues: Vec<Issue> = vec![];
         let mut issue_ids = hashset! {};
 
-        let issue_handler = github_client().issues(&self.owner, &self.repo);
+        let issue_handler = github_client().issues(owner, repo);
         let since_date = Utc::now() - Duration::days(self.since_days);
 
         for search_type in ["label", "milestone"] {
