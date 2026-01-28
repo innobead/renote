@@ -318,6 +318,9 @@ impl ReleaseArgs {
             }
             issue_ids.remove(&issue.number);
 
+            // Add issue author to contributors
+            contributors.insert(&issue.user.login);
+
             for assignee in &issue.assignees {
                 contributors.insert(&assignee.login);
             }
